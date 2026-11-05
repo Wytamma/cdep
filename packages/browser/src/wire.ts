@@ -13,6 +13,6 @@ export type ReceiverWire = {
 };
 
 export type SenderWire = {
-  accept(request: { offerId: string; formatId: string }): Promise<Result<AcceptAck>>;
+  accept(request: { offerId: string }): Promise<Result<AcceptAck>>;
   cancel(request: { transferId: string; reason?: string }): Promise<Result<CancelAck>>;
 };

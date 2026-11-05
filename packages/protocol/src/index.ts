@@ -4,5 +4,7 @@ export * from "./validate.js";
 export * from "./capabilities.js";
 export * from "./schemas.js";
 export * from "./negotiate.js";
+export * from "./bundle.js";
+export * from "./json.js";
 export * from "./state.js";
 export * from "./payload.js";

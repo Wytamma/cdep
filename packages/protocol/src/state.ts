@@ -2,7 +2,7 @@ import { fail, ok, type Result } from "./errors.js";
 import type { TransferEvent, TransferState } from "./types.js";
 
 /**
- * v0.1 transfer state machine.
+ * v0.3 transfer state machine.
  *
  *   CONNECTED → CAPABILITIES_DISCOVERED → OFFERED → ACCEPTED → TRANSFERRING → IMPORTED
  *

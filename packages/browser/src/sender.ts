@@ -1,6 +1,7 @@
 import { CallOptions } from "penpal";
 import {
   CdepException,
+  checkBundle,
   cdepError,
   fail,
   isPlainObject,
@@ -29,13 +30,20 @@ import { readRemoteResult, transportException } from "./result.js";
 import { openTransport, type Transport } from "./transport.js";
 import type { ReceiverWire, SenderWire } from "./wire.js";
 
+export interface SenderSelection {
+  /** Single-format selection; resolved to a concrete format after negotiation. */
+  format?: string;
+  /** Named bundle export supplied by the application. */
+  bundle?: string;
+}
+
 export interface SenderRun {
   targetUrl: string;
-  formatId?: string;
+  selection: SenderSelection;
   signal?: AbortSignal;
   capabilities: Capabilities;
   applicationName: string;
-  exportFor: (formatId: string) => Promise<ExportValue>;
+  exportFor: (selection: SenderSelection) => Promise<ExportValue>;
   maxBytes: number;
   connectTimeoutMs: number;
   handshakeTimeoutMs: number;
@@ -86,12 +94,6 @@ export async function sendDataset(run: SenderRun): Promise<Receipt> {
       if (parsed.value.offerId !== offer.offerId) {
         return fail("OFFER_UNKNOWN", "Unknown offer", { offerId: parsed.value.offerId });
       }
-      if (parsed.value.formatId !== offer.dataset.formatId) {
-        return fail("SCHEMA_MISMATCH", "Accepted format does not match the offer", {
-          offered: offer.dataset.formatId,
-          accepted: parsed.value.formatId,
-        });
-      }
       if (accepted) return fail("TRANSFER_STATE_INVALID", "The offer was already accepted");
 
       accepted = true;
@@ -134,38 +136,67 @@ export async function sendDataset(run: SenderRun): Promise<Receipt> {
     if (!capabilitiesResult.ok) throw new CdepException(capabilitiesResult.error);
     const remoteCapabilities = capabilitiesResult.value;
 
-    const matches = negotiate(run.capabilities.exports, remoteCapabilities.imports, {
-      ...(run.formatId === undefined ? {} : { requestedFormat: run.formatId }),
-    });
-    if (!matches.ok) throw new CdepException(matches.error);
-    const chosen = selectMatch(matches.value);
-    if (!chosen.ok) throw new CdepException(chosen.error);
-    const match = chosen.value;
-
-    const exported = await run.exportFor(match.formatId);
-    const payload = toTransferableBuffer(exported.data);
-    const sizeBytes = payloadByteLength(payload.data);
-    const limit = Math.min(match.maxBytes ?? Number.POSITIVE_INFINITY, run.maxBytes);
-    if (sizeBytes > limit) {
-      throw new CdepException(
-        cdepError("SIZE_EXCEEDED", "The dataset exceeds the negotiated size limit", {
-          formatId: match.formatId,
-          sizeBytes,
-          maxBytes: limit,
-        }),
-      );
+    let exported: ExportValue;
+    if (run.selection.bundle !== undefined) {
+      exported = await run.exportFor(run.selection);
+    } else {
+      const matches = negotiate(run.capabilities.exports, remoteCapabilities.imports, {
+        ...(run.selection.format === undefined
+          ? {}
+          : { requestedFormat: run.selection.format }),
+      });
+      if (!matches.ok) throw new CdepException(matches.error);
+      const chosen = selectMatch(matches.value);
+      if (!chosen.ok) throw new CdepException(chosen.error);
+      exported = await run.exportFor({ format: chosen.value.formatId });
     }
+
+    const prepared = exported.files.map((file) => {
+      const formatId = file.formatId;
+      if (formatId === undefined) {
+        throw new CdepException(
+          cdepError("INTERNAL", "The export adapter returned a file without a format"),
+        );
+      }
+      const payload = toTransferableBuffer(file.data);
+      return {
+        name: file.name,
+        formatId,
+        mediaType: file.mediaType,
+        schema: file.schema,
+        metadata: file.metadata,
+        data: payload.data,
+        buffer: payload.buffer,
+        sizeBytes: payloadByteLength(payload.data),
+      };
+    });
+
+    const checked = checkBundle(
+      prepared.map((file) => ({
+        name: file.name,
+        formatId: file.formatId,
+        sizeBytes: file.sizeBytes,
+        ...(file.schema === undefined ? {} : { schema: file.schema }),
+      })),
+      { capabilities: remoteCapabilities.imports, maxBytes: run.maxBytes },
+    );
+    if (!checked.ok) throw new CdepException(checked.error);
 
     const issuedAt = Date.now();
     offer = {
       offerId: randomId(),
       transferId: randomId(),
       dataset: {
-        formatId: match.formatId,
-        name: exported.name ?? defaultDatasetName(run.capabilities, match.formatId),
-        sizeBytes,
-        ...(exported.mediaType === undefined ? {} : { mediaType: exported.mediaType }),
-        ...(exported.schema === undefined ? {} : { schema: exported.schema }),
+        name: exported.name ?? "CDEP bundle",
+        sizeBytes: checked.value.totalBytes,
+        files: prepared.map((file) => ({
+          name: file.name,
+          formatId: file.formatId,
+          sizeBytes: file.sizeBytes,
+          ...(file.mediaType === undefined ? {} : { mediaType: file.mediaType }),
+          ...(file.schema === undefined ? {} : { schema: file.schema }),
+          ...(file.metadata === undefined ? {} : { metadata: file.metadata }),
+        })),
       },
       sender: { origin: senderWindow.location.origin, application: run.applicationName },
       issuedAt,
@@ -201,15 +232,17 @@ export async function sendDataset(run: SenderRun): Promise<Receipt> {
       await remote.transfer(
         {
           transferId: proposed.transferId,
-          formatId: proposed.dataset.formatId,
-          sizeBytes,
-          ...(proposed.dataset.mediaType === undefined
-            ? {}
-            : { mediaType: proposed.dataset.mediaType }),
-          data: payload.data,
+          sizeBytes: checked.value.totalBytes,
+          files: prepared.map((file) => ({
+            name: file.name,
+            formatId: file.formatId,
+            sizeBytes: file.sizeBytes,
+            ...(file.metadata === undefined ? {} : { metadata: file.metadata }),
+            data: file.data,
+          })),
         },
         new CallOptions({
-          transferables: payload.buffer ? [payload.buffer] : [],
+          transferables: prepared.flatMap((file) => (file.buffer ? [file.buffer] : [])),
           timeout: run.methodTimeoutMs,
         }),
       ),
@@ -279,11 +312,6 @@ function watchSession(options: SessionWatchOptions): () => void {
   return stop;
 }
 
-function defaultDatasetName(capabilities: Capabilities, formatId: string): string {
-  const capability = capabilities.exports.find((candidate) => candidate.id === formatId);
-  return `${capability?.label ?? formatId} dataset`;
-}
-
 function validateOfferAck(payload: unknown, expected: Offer): Result<OfferAck> {
   if (!isPlainObject(payload)) return fail("OFFER_INVALID", "offer: malformed acknowledgement");
   if (payload.offerId !== expected.offerId) return fail("OFFER_INVALID", "offer: offerId mismatch");
@@ -316,21 +344,34 @@ function validateReceipt(payload: unknown, offer: Offer): Result<Receipt> {
   if (payload.transferId !== offer.transferId) {
     return fail("INTERNAL", "transfer: transferId mismatch");
   }
-  if (payload.formatId !== offer.dataset.formatId) {
-    return fail("INTERNAL", "transfer: formatId mismatch");
-  }
   if (payload.sizeBytes !== offer.dataset.sizeBytes) {
     return fail("INTERNAL", "transfer: receipt size does not match the offer");
   }
+  if (payload.fileCount !== offer.dataset.files.length) {
+    return fail("INTERNAL", "transfer: receipt file count does not match the offer");
+  }
+
+  const expectedFormats = [...new Set(offer.dataset.files.map((file) => file.formatId))].sort();
+  const receivedFormats = payload.formats;
+  if (
+    !Array.isArray(receivedFormats) ||
+    receivedFormats.length !== expectedFormats.length ||
+    !receivedFormats.every((format) => typeof format === "string") ||
+    [...receivedFormats].sort().some((format, index) => format !== expectedFormats[index])
+  ) {
+    return fail("INTERNAL", "transfer: receipt formats do not match the offer");
+  }
+
   const importedAt = payload.importedAt;
   if (typeof importedAt !== "number" || !Number.isFinite(importedAt)) {
     return fail("INTERNAL", "transfer: invalid import timestamp");
   }
   return ok({
     transferId: offer.transferId,
-    formatId: offer.dataset.formatId,
     state: "IMPORTED",
     importedAt,
     sizeBytes: offer.dataset.sizeBytes,
+    fileCount: offer.dataset.files.length,
+    formats: expectedFormats,
   });
 }

@@ -1,3 +1,10 @@
+export interface ConsentFile {
+  name: string;
+  sizeBytes: number;
+  formatId: string;
+  formatLabel: string;
+}
+
 export interface ConsentRequest {
   /** Receiving application's own name, so the dialog is unambiguous. */
   receiverApplication: string;
@@ -5,9 +12,9 @@ export interface ConsentRequest {
   /** Origin verified by the transport, never a claimed value. */
   senderOrigin: string;
   datasetName: string;
-  formatLabel: string;
-  formatId: string;
+  /** Total size of all files. */
   sizeBytes: number;
+  files: ConsentFile[];
 }
 
 export interface ConsentOptions {
@@ -35,6 +42,12 @@ const STYLE = `
   dl { margin: 0 0 16px; display: grid; grid-template-columns: 92px 1fr; gap: 8px 12px; }
   dt { color: #64748b; }
   dd { margin: 0; overflow-wrap: anywhere; }
+  .files { margin: 0 0 16px; }
+  .files-heading { margin: 0 0 6px; color: #64748b; }
+  .files ul { margin: 0; padding: 0; list-style: none; display: grid; gap: 4px; }
+  .files li { display: grid; grid-template-columns: 1fr auto auto; gap: 10px; align-items: baseline; }
+  .files li span:nth-child(2) { color: #64748b; font-size: 12px; }
+  .files li span:last-child { color: #64748b; white-space: nowrap; }
   .warning {
     margin: 0 0 18px; padding: 10px 12px; border-radius: 8px;
     background: #fef3c7; color: #78350f;
@@ -47,6 +60,8 @@ const STYLE = `
   button.accept { background: #0f172a; border-color: #0f172a; color: #fff; }
   button:focus-visible { outline: 3px solid #2563eb; outline-offset: 2px; }
 `;
+
+const MAX_LISTED_FILES = 8;
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -114,8 +129,32 @@ function showConsentDialog(
   addRow("From", request.senderApplication);
   addRow("Origin", request.senderOrigin);
   addRow("Dataset", request.datasetName);
-  addRow("Format", `${request.formatLabel} (${request.formatId})`);
-  addRow("Size", formatBytes(request.sizeBytes));
+  addRow("Total size", formatBytes(request.sizeBytes));
+
+  const files = doc.createElement("div");
+  files.className = "files";
+  const filesHeading = doc.createElement("p");
+  filesHeading.className = "files-heading";
+  filesHeading.textContent =
+    request.files.length === 1 ? "1 file" : `${request.files.length} files`;
+  const fileList = doc.createElement("ul");
+  for (const file of request.files.slice(0, MAX_LISTED_FILES)) {
+    const item = doc.createElement("li");
+    const fileName = doc.createElement("span");
+    fileName.textContent = file.name;
+    const fileFormat = doc.createElement("span");
+    fileFormat.textContent = file.formatLabel;
+    const fileSize = doc.createElement("span");
+    fileSize.textContent = formatBytes(file.sizeBytes);
+    item.append(fileName, fileFormat, fileSize);
+    fileList.append(item);
+  }
+  if (request.files.length > MAX_LISTED_FILES) {
+    const more = doc.createElement("li");
+    more.textContent = `+${request.files.length - MAX_LISTED_FILES} more`;
+    fileList.append(more);
+  }
+  files.append(filesHeading, fileList);
 
   const warning = doc.createElement("p");
   warning.className = "warning";
@@ -133,7 +172,7 @@ function showConsentDialog(
   accept.className = "accept";
   accept.textContent = "Accept";
   actions.append(decline, accept);
-  body.append(title, subtitle, details, warning, actions);
+  body.append(title, subtitle, details, files, warning, actions);
   dialog.append(body);
   shadow.append(style, dialog);
 

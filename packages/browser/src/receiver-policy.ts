@@ -1,9 +1,11 @@
 import {
+  checkBundle,
   fail,
-  findImportCapability,
+  jsonEquals,
   payloadByteLength,
   validateOffer,
   validateTransferRequest,
+  type BundleStats,
   type Capabilities,
   type Offer,
   type Result,
@@ -20,6 +22,8 @@ export interface OfferContext {
   capabilities: Capabilities;
   /** Format identifiers that actually have a registered import adapter. */
   importIds: readonly string[];
+  /** Whether a bundle-level import handler is registered (mixed formats). */
+  bundleImport: boolean;
   /** Origin verified from the raw handshake, not the offer's claim. */
   verifiedOrigin: string;
   maxBytes: number;
@@ -29,7 +33,7 @@ export interface OfferContext {
 
 export interface OfferDecision {
   offer: Offer;
-  limit: number;
+  stats: BundleStats;
 }
 
 export function checkOffer(input: unknown, context: OfferContext): Result<OfferDecision> {
@@ -50,28 +54,25 @@ export function checkOffer(input: unknown, context: OfferContext): Result<OfferD
   if (context.knownTransferIds.has(offer.transferId)) {
     return fail("TRANSFER_STATE_INVALID", "This transfer id is already in use");
   }
-  if (!context.importIds.includes(offer.dataset.formatId)) {
-    return fail("NO_COMMON_FORMAT", "The offered format is not importable here", {
-      formatId: offer.dataset.formatId,
-    });
+
+  const importCapabilities = context.capabilities.imports.filter((capability) =>
+    context.importIds.includes(capability.id),
+  );
+  const checked = checkBundle(offer.dataset.files, {
+    capabilities: importCapabilities,
+    maxBytes: context.maxBytes,
+  });
+  if (!checked.ok) return checked;
+
+  if (checked.value.formats.length > 1 && !context.bundleImport) {
+    return fail(
+      "NO_COMMON_FORMAT",
+      "This application cannot import mixed-format bundles",
+      { formats: checked.value.formats },
+    );
   }
 
-  const capability = findImportCapability(context.capabilities, offer.dataset.formatId);
-  if (!capability) {
-    return fail("NO_COMMON_FORMAT", "The offered format is not declared as importable", {
-      formatId: offer.dataset.formatId,
-    });
-  }
-
-  const limit = Math.min(capability.maxBytes ?? Number.POSITIVE_INFINITY, context.maxBytes);
-  if (offer.dataset.sizeBytes > limit) {
-    return fail("SIZE_EXCEEDED", "The offered dataset exceeds the local size limit", {
-      sizeBytes: offer.dataset.sizeBytes,
-      maxBytes: limit,
-    });
-  }
-
-  return { ok: true, value: { offer, limit } };
+  return { ok: true, value: { offer, stats: checked.value } };
 }
 
 export interface TransferContext {
@@ -84,7 +85,7 @@ export interface TransferContext {
 export interface TransferDecision {
   request: TransferRequest;
   sizeBytes: number;
-  limit: number;
+  formats: string[];
 }
 
 export function checkTransfer(input: unknown, context: TransferContext): Result<TransferDecision> {
@@ -104,31 +105,75 @@ export function checkTransfer(input: unknown, context: TransferContext): Result<
   if (context.now > record.offer.expiresAt) {
     return fail("OFFER_EXPIRED", "The offer expired before the payload arrived");
   }
-  if (request.formatId !== record.offer.dataset.formatId) {
-    return fail("SCHEMA_MISMATCH", "Payload format does not match the accepted offer", {
-      offered: record.offer.dataset.formatId,
-      received: request.formatId,
+
+  const offered = record.offer.dataset.files;
+  if (request.files.length !== offered.length) {
+    return fail("PAYLOAD_INVALID", "File count does not match the offer", {
+      received: request.files.length,
+      offered: offered.length,
     });
   }
 
-  const actualSize = payloadByteLength(request.data);
-  if (actualSize !== request.sizeBytes || actualSize !== record.offer.dataset.sizeBytes) {
-    return fail("PAYLOAD_SIZE_MISMATCH", "Payload size does not match the offer", {
+  const actual: Array<{
+    name: string;
+    formatId: string;
+    sizeBytes: number;
+    schema: (typeof offered)[number]["schema"];
+  }> = [];
+  let totalBytes = 0;
+
+  for (const file of request.files) {
+    const expected = offered.find((candidate) => candidate.name === file.name);
+    if (!expected) {
+      return fail("PAYLOAD_INVALID", `Unexpected file "${file.name}"`);
+    }
+    if (file.formatId !== expected.formatId) {
+      return fail("PAYLOAD_INVALID", `File "${file.name}" changed format`, {
+        file: file.name,
+        offered: expected.formatId,
+        received: file.formatId,
+      });
+    }
+    if (!jsonEquals(file.metadata, expected.metadata)) {
+      return fail("PAYLOAD_INVALID", `File "${file.name}" metadata differs from the offer`, {
+        file: file.name,
+      });
+    }
+    const size = payloadByteLength(file.data);
+    if (size !== file.sizeBytes || size !== expected.sizeBytes) {
+      return fail("PAYLOAD_SIZE_MISMATCH", `File "${file.name}" does not match the offered size`, {
+        file: file.name,
+        declared: file.sizeBytes,
+        actual: size,
+        offered: expected.sizeBytes,
+      });
+    }
+    totalBytes += size;
+    actual.push({
+      name: file.name,
+      formatId: file.formatId,
+      sizeBytes: size,
+      schema: expected.schema,
+    });
+  }
+
+  if (totalBytes !== request.sizeBytes || totalBytes !== record.offer.dataset.sizeBytes) {
+    return fail("PAYLOAD_SIZE_MISMATCH", "Bundle size does not match the offer", {
       declared: request.sizeBytes,
-      actual: actualSize,
+      actual: totalBytes,
       offered: record.offer.dataset.sizeBytes,
     });
   }
 
-  const capability = findImportCapability(context.capabilities, request.formatId);
-  const limit = Math.min(capability?.maxBytes ?? Number.POSITIVE_INFINITY, context.maxBytes);
-  if (actualSize > limit) {
-    return fail("SIZE_EXCEEDED", "Payload exceeds the local size limit", {
-      sizeBytes: actualSize,
-      maxBytes: limit,
-    });
-  }
+  const importCapabilities = context.capabilities.imports;
+  const checked = checkBundle(actual, {
+    capabilities: importCapabilities,
+    maxBytes: context.maxBytes,
+  });
+  if (!checked.ok) return checked;
 
-  return { ok: true, value: { request, sizeBytes: actualSize, limit } };
+  return {
+    ok: true,
+    value: { request, sizeBytes: totalBytes, formats: checked.value.formats },
+  };
 }
-

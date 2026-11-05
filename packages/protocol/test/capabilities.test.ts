@@ -6,7 +6,7 @@ import {
 
 const valid: Capabilities = {
   protocol: "cdep",
-  version: 1,
+  version: 3,
   application: { name: "Tree Viewer", url: "https://treeviewer.example" },
   imports: [
     {
@@ -39,11 +39,11 @@ describe("validateCapabilities", () => {
   });
 
   it("rejects an unsupported version and reports both versions", () => {
-    const result = validateCapabilities({ ...valid, version: 2 });
+    const result = validateCapabilities({ ...valid, version: 4 });
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.error.code).toBe("VERSION_UNSUPPORTED");
-      expect(result.error.details).toMatchObject({ received: 2, supported: 1 });
+      expect(result.error.details).toMatchObject({ received: 4, supported: 3 });
     }
   });
 
@@ -78,6 +78,34 @@ describe("validateCapabilities", () => {
     const result = validateCapabilities({
       ...valid,
       imports: [{ id: "org.cdep.format.newick.v1", maxBytes: 0 }],
+    });
+    expect(result.ok).toBe(false);
+  });
+
+  it("accepts bundle limits", () => {
+    const result = validateCapabilities({
+      ...valid,
+      imports: [{ ...valid.imports[0], maxFiles: 8, maxFileBytes: 1024 }],
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.imports[0]).toMatchObject({ maxFiles: 8, maxFileBytes: 1024 });
+    }
+  });
+
+  it.each([0, 17, 1.5])("rejects maxFiles %s", (maxFiles) => {
+    const result = validateCapabilities({
+      ...valid,
+      imports: [{ id: "org.cdep.format.newick.v1", maxFiles }],
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe("CAPABILITIES_INVALID");
+  });
+
+  it("rejects a zero per-file ceiling", () => {
+    const result = validateCapabilities({
+      ...valid,
+      imports: [{ id: "org.cdep.format.newick.v1", maxFileBytes: 0 }],
     });
     expect(result.ok).toBe(false);
   });

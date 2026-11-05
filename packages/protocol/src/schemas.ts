@@ -1,5 +1,14 @@
 import { fail, type Result } from "./errors.js";
-import type { AcceptRequest, CancelRequest, Offer, SchemaRef, TransferRequest } from "./types.js";
+import {
+  MAX_BUNDLE_FILES,
+  type AcceptRequest,
+  type CancelRequest,
+  type DatasetFileDescriptor,
+  type Offer,
+  type SchemaRef,
+  type TransferFile,
+  type TransferRequest,
+} from "./types.js";
 import {
   isArrayBuffer,
   isNonEmptyString,
@@ -7,6 +16,7 @@ import {
   isPlainObject,
   isPositiveSafeInteger,
 } from "./validate.js";
+import { normalizeJson, type JsonValue } from "./json.js";
 
 export const MAX_DATASET_NAME = 200;
 export const MAX_TRANSFER_ID = 128;
@@ -61,6 +71,84 @@ function isTimestamp(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
+function readFileDescriptors(value: unknown): Result<DatasetFileDescriptor[]> {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_BUNDLE_FILES) {
+    return fail(
+      "OFFER_INVALID",
+      `dataset.files must contain between 1 and ${MAX_BUNDLE_FILES} files`,
+    );
+  }
+
+  const files: DatasetFileDescriptor[] = [];
+  const names = new Set<string>();
+  let total = 0;
+
+  for (let index = 0; index < value.length; index += 1) {
+    const entry: unknown = value[index];
+    if (!isPlainObject(entry)) {
+      return fail("OFFER_INVALID", `dataset.files[${index}] must be an object`);
+    }
+    const name = entry.name;
+    if (!isDatasetName(name)) {
+      return fail(
+        "OFFER_INVALID",
+        `dataset.files[${index}].name must be 1-${MAX_DATASET_NAME} characters without control characters`,
+      );
+    }
+    if (names.has(name)) return fail("OFFER_INVALID", `Duplicate file name "${name}"`);
+    names.add(name);
+
+    const formatId = entry.formatId;
+    if (!isFormatId(formatId)) {
+      return fail("OFFER_INVALID", `dataset.files[${index}].formatId must be a namespaced identifier`);
+    }
+    const sizeBytes = entry.sizeBytes;
+    if (!isNonNegativeSafeInteger(sizeBytes)) {
+      return fail("OFFER_INVALID", `dataset.files[${index}].sizeBytes must be a non-negative integer`);
+    }
+    if (!Number.isSafeInteger(total + sizeBytes)) {
+      return fail("OFFER_INVALID", "Total bundle size is not a safe integer");
+    }
+    total += sizeBytes;
+
+    const mediaType = entry.mediaType;
+    if (mediaType !== undefined && !isNonEmptyString(mediaType, 200)) {
+      return fail("OFFER_INVALID", `dataset.files[${index}].mediaType must be a short string`);
+    }
+
+    let schema: SchemaRef | undefined;
+    if (entry.schema !== undefined) {
+      if (!isSchemaRef(entry.schema)) {
+        return fail("OFFER_INVALID", `dataset.files[${index}].schema must be a valid schema reference`);
+      }
+      schema = entry.schema;
+    }
+
+    let metadata: JsonValue | undefined;
+    if (entry.metadata !== undefined) {
+      const normalized = normalizeJson(entry.metadata);
+      if (!normalized.ok) {
+        return fail(
+          "OFFER_INVALID",
+          `dataset.files[${index}].metadata is invalid: ${normalized.reason}`,
+        );
+      }
+      metadata = normalized.value;
+    }
+
+    files.push({
+      name,
+      formatId,
+      sizeBytes,
+      ...(mediaType === undefined ? {} : { mediaType }),
+      ...(schema === undefined ? {} : { schema }),
+      ...(metadata === undefined ? {} : { metadata }),
+    });
+  }
+
+  return { ok: true, value: files };
+}
+
 /**
  * Offer validation. The sender is untrusted: every field is checked before it
  * can reach a human or an import adapter.
@@ -70,7 +158,6 @@ export function validateOffer(input: unknown): Result<Offer> {
 
   const dataset = input.dataset;
   if (!isPlainObject(dataset)) return fail("OFFER_INVALID", "dataset must be an object");
-
   const sender = input.sender;
   if (!isPlainObject(sender)) return fail("OFFER_INVALID", "sender must be an object");
 
@@ -90,25 +177,19 @@ export function validateOffer(input: unknown): Result<Offer> {
       `dataset.name must be 1-${MAX_DATASET_NAME} characters without control characters`,
     );
   }
-  const formatId = dataset.formatId;
-  if (!isFormatId(formatId)) {
-    return fail("OFFER_INVALID", "dataset.formatId must be a namespaced lowercase identifier");
-  }
   const sizeBytes = dataset.sizeBytes;
   if (!isNonNegativeSafeInteger(sizeBytes)) {
     return fail("OFFER_INVALID", "dataset.sizeBytes must be a non-negative integer");
   }
-  const mediaType = dataset.mediaType;
-  if (mediaType !== undefined && !isNonEmptyString(mediaType, 200)) {
-    return fail("OFFER_INVALID", "dataset.mediaType must be a short non-empty string");
-  }
 
-  let schema: SchemaRef | undefined;
-  if (dataset.schema !== undefined) {
-    if (!isSchemaRef(dataset.schema)) {
-      return fail("OFFER_INVALID", "dataset.schema must be a valid schema reference");
-    }
-    schema = dataset.schema;
+  const files = readFileDescriptors(dataset.files);
+  if (!files.ok) return files;
+  const total = files.value.reduce((sum, file) => sum + file.sizeBytes, 0);
+  if (total !== sizeBytes) {
+    return fail("OFFER_INVALID", "dataset.sizeBytes must equal the sum of file sizes", {
+      sizeBytes,
+      total,
+    });
   }
 
   const senderOrigin = sender.origin;
@@ -128,7 +209,7 @@ export function validateOffer(input: unknown): Result<Offer> {
     return fail("OFFER_INVALID", "expiresAt must be after issuedAt");
   }
   if (expiresAt - issuedAt > MAX_OFFER_LIFETIME_MS) {
-    return fail("OFFER_INVALID", "Offer lifetime may not exceed one hour");
+    return fail("OFFER_INVALID", "Offer lifetime must not exceed one hour");
   }
 
   return {
@@ -136,13 +217,7 @@ export function validateOffer(input: unknown): Result<Offer> {
     value: {
       offerId,
       transferId,
-      dataset: {
-        formatId,
-        name,
-        sizeBytes,
-        ...(mediaType === undefined ? {} : { mediaType }),
-        ...(schema === undefined ? {} : { schema }),
-      },
+      dataset: { name, sizeBytes, files: files.value },
       sender: { origin: senderOrigin, application: senderApplication },
       issuedAt,
       expiresAt,
@@ -156,11 +231,72 @@ export function validateAcceptRequest(input: unknown): Result<AcceptRequest> {
   if (!isTransferId(offerId)) {
     return fail("OFFER_INVALID", "offerId must be 8-128 identifier characters");
   }
-  const formatId = input.formatId;
-  if (!isFormatId(formatId)) {
-    return fail("OFFER_INVALID", "formatId must be a namespaced lowercase identifier");
+  return { ok: true, value: { offerId } };
+}
+
+function readTransferFiles(value: unknown): Result<TransferFile[]> {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_BUNDLE_FILES) {
+    return fail("PAYLOAD_INVALID", `files must contain between 1 and ${MAX_BUNDLE_FILES} files`);
   }
-  return { ok: true, value: { offerId, formatId } };
+
+  const files: TransferFile[] = [];
+  const names = new Set<string>();
+  let total = 0;
+
+  for (let index = 0; index < value.length; index += 1) {
+    const entry: unknown = value[index];
+    if (!isPlainObject(entry)) {
+      return fail("PAYLOAD_INVALID", `files[${index}] must be an object`);
+    }
+    const name = entry.name;
+    if (!isDatasetName(name)) {
+      return fail(
+        "PAYLOAD_INVALID",
+        `files[${index}].name must be 1-${MAX_DATASET_NAME} characters without control characters`,
+      );
+    }
+    if (names.has(name)) return fail("PAYLOAD_INVALID", `Duplicate file name "${name}"`);
+    names.add(name);
+
+    const formatId = entry.formatId;
+    if (!isFormatId(formatId)) {
+      return fail("PAYLOAD_INVALID", `files[${index}].formatId must be a namespaced identifier`);
+    }
+    const sizeBytes = entry.sizeBytes;
+    if (!isNonNegativeSafeInteger(sizeBytes)) {
+      return fail("PAYLOAD_INVALID", `files[${index}].sizeBytes must be a non-negative integer`);
+    }
+    const data = entry.data;
+    if (typeof data !== "string" && !isArrayBuffer(data)) {
+      return fail("PAYLOAD_INVALID", `files[${index}].data must be a string or an ArrayBuffer`);
+    }
+    if (!Number.isSafeInteger(total + sizeBytes)) {
+      return fail("PAYLOAD_INVALID", "Total bundle size is not a safe integer");
+    }
+
+    let metadata: JsonValue | undefined;
+    if (entry.metadata !== undefined) {
+      const normalized = normalizeJson(entry.metadata);
+      if (!normalized.ok) {
+        return fail(
+          "PAYLOAD_INVALID",
+          `files[${index}].metadata is invalid: ${normalized.reason}`,
+        );
+      }
+      metadata = normalized.value;
+    }
+
+    total += sizeBytes;
+    files.push({
+      name,
+      formatId,
+      sizeBytes,
+      ...(metadata === undefined ? {} : { metadata }),
+      data,
+    });
+  }
+
+  return { ok: true, value: files };
 }
 
 export function validateTransferRequest(input: unknown): Result<TransferRequest> {
@@ -169,32 +305,22 @@ export function validateTransferRequest(input: unknown): Result<TransferRequest>
   if (!isTransferId(transferId)) {
     return fail("PAYLOAD_INVALID", "transferId must be 8-128 identifier characters");
   }
-  const formatId = input.formatId;
-  if (!isFormatId(formatId)) {
-    return fail("PAYLOAD_INVALID", "formatId must be a namespaced lowercase identifier");
-  }
   const sizeBytes = input.sizeBytes;
   if (!isNonNegativeSafeInteger(sizeBytes)) {
     return fail("PAYLOAD_INVALID", "sizeBytes must be a non-negative integer");
   }
-  const data = input.data;
-  if (typeof data !== "string" && !isArrayBuffer(data)) {
-    return fail("PAYLOAD_INVALID", "data must be a string or an ArrayBuffer");
-  }
-  const mediaType = input.mediaType;
-  if (mediaType !== undefined && !isNonEmptyString(mediaType, 200)) {
-    return fail("PAYLOAD_INVALID", "mediaType must be a short non-empty string");
-  }
-  return {
-    ok: true,
-    value: {
-      transferId,
-      formatId,
+
+  const files = readTransferFiles(input.files);
+  if (!files.ok) return files;
+  const total = files.value.reduce((sum, file) => sum + file.sizeBytes, 0);
+  if (total !== sizeBytes) {
+    return fail("PAYLOAD_INVALID", "sizeBytes must equal the sum of file sizes", {
       sizeBytes,
-      ...(mediaType === undefined ? {} : { mediaType }),
-      data,
-    },
-  };
+      total,
+    });
+  }
+
+  return { ok: true, value: { transferId, sizeBytes, files: files.value } };
 }
 
 export function validateCancelRequest(input: unknown): Result<CancelRequest> {
@@ -207,8 +333,5 @@ export function validateCancelRequest(input: unknown): Result<CancelRequest> {
   if (reason !== undefined && (typeof reason !== "string" || reason.length > MAX_TRANSFER_MESSAGE)) {
     return fail("PAYLOAD_INVALID", `reason must be up to ${MAX_TRANSFER_MESSAGE} characters`);
   }
-  return {
-    ok: true,
-    value: { transferId, ...(reason === undefined ? {} : { reason }) },
-  };
+  return { ok: true, value: { transferId, ...(reason === undefined ? {} : { reason }) } };
 }

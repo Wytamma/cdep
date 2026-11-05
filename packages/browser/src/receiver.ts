@@ -4,7 +4,6 @@ import {
   asCdepError,
   cdepError,
   fail,
-  findImportCapability,
   isPlainObject,
   isTerminalState,
   ok,
@@ -15,7 +14,8 @@ import {
   type Capabilities,
   type CdepError,
   type ImportContext,
-  type ImportedDataset,
+  type ImportedBundle,
+  type ImportedFile,
   type Offer,
   type OfferAck,
   type Receipt,
@@ -30,8 +30,15 @@ import { readRemoteResult, toTransportError } from "./result.js";
 import { openTransport, type Transport } from "./transport.js";
 import type { ReceiverWire, SenderWire } from "./wire.js";
 
+/** Called with every file of one format when the bundle is single-format. */
 export type ImportHandler = (
-  dataset: ImportedDataset,
+  files: ImportedFile[],
+  context: ImportContext,
+) => void | Promise<void>;
+
+/** Called with the whole bundle; required when a bundle mixes formats. */
+export type BundleImportHandler = (
+  bundle: ImportedBundle,
   context: ImportContext,
 ) => void | Promise<void>;
 
@@ -39,13 +46,15 @@ export interface ReceiverSnapshot {
   transferId: string;
   state: TransferState;
   datasetName: string;
-  formatId: string;
+  fileCount: number;
+  formats: string[];
   error?: CdepError;
 }
 
 export interface ReceiverOptions {
   capabilities: Capabilities;
   imports: Record<string, ImportHandler>;
+  importBundle?: BundleImportHandler;
   maxBytes: number;
   handshakeTimeoutMs: number;
   connectTimeoutMs: number;
@@ -81,7 +90,9 @@ export function startReceiverSession(
   options: ReceiverOptions,
 ): ReceiverSession {
   const records = new Map<string, TransferRecord>();
-  const importIds = Object.keys(options.imports);
+  const importIds = options.importBundle
+    ? options.capabilities.imports.map((capability) => capability.id)
+    : Object.keys(options.imports);
   let transport: Transport<SenderWire> | undefined;
   let verifiedOrigin = "";
   let destroyed = false;
@@ -91,7 +102,8 @@ export function startReceiverSession(
       transferId: record.offer.transferId,
       state: record.state,
       datasetName: record.offer.dataset.name,
-      formatId: record.offer.dataset.formatId,
+      fileCount: record.offer.dataset.files.length,
+      formats: distinctFormats(record.offer),
       ...(record.error === undefined ? {} : { error: record.error }),
     });
   };
@@ -108,17 +120,21 @@ export function startReceiverSession(
     const decision = checkOffer(input, {
       capabilities: options.capabilities,
       importIds,
+      bundleImport: options.importBundle !== undefined,
       verifiedOrigin,
       maxBytes: options.maxBytes,
       now: Date.now(),
       knownTransferIds: new Set(records.keys()),
     });
     if (!decision.ok) return decision;
-    const offer = decision.value.offer;
 
-    const capability = findImportCapability(options.capabilities, offer.dataset.formatId);
-    if (!capability) {
-      return fail("NO_COMMON_FORMAT", "The offered format is not declared as importable");
+    const offer = decision.value.offer;
+    const formats = decision.value.stats.formats;
+    const [onlyFormat] = formats;
+    if (formats.length === 1 && onlyFormat !== undefined && !options.imports[onlyFormat]) {
+      return fail("NO_COMMON_FORMAT", "The offered format has no import adapter", {
+        formatId: onlyFormat,
+      });
     }
 
     const record: TransferRecord = { offer, state: "OFFERED", updatedAt: Date.now() };
@@ -130,14 +146,22 @@ export function startReceiverSession(
       senderApplication: offer.sender.application,
       senderOrigin: verifiedOrigin,
       datasetName: offer.dataset.name,
-      formatLabel: capability.label ?? offer.dataset.formatId,
-      formatId: offer.dataset.formatId,
       sizeBytes: offer.dataset.sizeBytes,
+      files: offer.dataset.files.map((file) => {
+        const capability = options.capabilities.imports.find(
+          (candidate) => candidate.id === file.formatId,
+        );
+        return {
+          name: file.name,
+          sizeBytes: file.sizeBytes,
+          formatId: file.formatId,
+          formatLabel: capability?.label ?? file.formatId,
+        };
+      }),
     };
     const approved = await requestConsent(consentRequest, {
       ...options.consent,
-      timeoutMs:
-        options.consent.timeoutMs ?? Math.max(1_000, offer.expiresAt - Date.now()),
+      timeoutMs: options.consent.timeoutMs ?? Math.max(1_000, offer.expiresAt - Date.now()),
     });
 
     if (!approved) {
@@ -162,7 +186,7 @@ export function startReceiverSession(
     try {
       const ack = readRemoteResult(
         await remote.accept(
-          { offerId: offer.offerId, formatId: offer.dataset.formatId },
+          { offerId: offer.offerId },
           new CallOptions({ timeout: options.methodTimeoutMs }),
         ),
         validateAcceptAck,
@@ -210,7 +234,9 @@ export function startReceiverSession(
       const fatal =
         decision.error.code === "PAYLOAD_SIZE_MISMATCH" ||
         decision.error.code === "SIZE_EXCEEDED" ||
-        decision.error.code === "SCHEMA_MISMATCH";
+        decision.error.code === "SCHEMA_MISMATCH" ||
+        decision.error.code === "PAYLOAD_INVALID" ||
+        decision.error.code === "FILE_COUNT_EXCEEDED";
       const expired = decision.error.code === "OFFER_EXPIRED";
       if (record && (fatal || expired)) {
         record.state = expired ? "TIMED_OUT" : "FAILED";
@@ -221,7 +247,7 @@ export function startReceiverSession(
       return decision;
     }
 
-    const { request, sizeBytes } = decision.value;
+    const { request, sizeBytes, formats } = decision.value;
     if (!record) return fail("OFFER_UNKNOWN", "Unknown transfer");
 
     const started = transition(record.state, "TRANSFER_START");
@@ -230,29 +256,51 @@ export function startReceiverSession(
     record.updatedAt = Date.now();
     notify(record);
 
-    const dataset: ImportedDataset = {
-      formatId: request.formatId,
-      name: record.offer.dataset.name,
-      sizeBytes,
-      ...(record.offer.dataset.mediaType === undefined
-        ? {}
-        : { mediaType: record.offer.dataset.mediaType }),
-      data: request.data,
+    const offered = record.offer.dataset.files;
+    const files: ImportedFile[] = request.files.map((file) => {
+      const descriptor = offered.find((candidate) => candidate.name === file.name);
+      return {
+        name: file.name,
+        formatId: file.formatId,
+        sizeBytes: file.sizeBytes,
+        ...(descriptor?.mediaType === undefined ? {} : { mediaType: descriptor.mediaType }),
+        ...(descriptor?.schema === undefined ? {} : { schema: descriptor.schema }),
+        ...(file.metadata === undefined ? {} : { metadata: file.metadata }),
+        data: file.data,
+      };
+    });
+
+    const context: ImportContext = {
+      transferId: request.transferId,
+      senderOrigin: verifiedOrigin,
+      senderApplication: record.offer.sender.application,
+      bundle: {
+        name: record.offer.dataset.name,
+        sizeBytes,
+        files: offered.map((file) => ({ name: file.name, formatId: file.formatId })),
+      },
     };
 
-    const handler = options.imports[request.formatId];
-    if (!handler) {
-      return fail("NO_COMMON_FORMAT", "The format is no longer importable", {
-        formatId: request.formatId,
-      });
-    }
-
     try {
-      await handler(dataset, {
-        transferId: request.transferId,
-        senderOrigin: verifiedOrigin,
-        senderApplication: record.offer.sender.application,
-      });
+      if (formats.length > 1) {
+        const handler = options.importBundle;
+        if (!handler) {
+          return fail("NO_COMMON_FORMAT", "Mixed-format bundles are not supported here", {
+            formats,
+          });
+        }
+        await handler({ name: record.offer.dataset.name, sizeBytes, files }, context);
+      } else {
+        const [formatId] = formats;
+        if (formatId === undefined) {
+          return fail("PAYLOAD_INVALID", "The bundle contains no files");
+        }
+        const handler = options.imports[formatId];
+        if (!handler) {
+          return fail("NO_COMMON_FORMAT", "The format is no longer importable", { formatId });
+        }
+        await handler(files, context);
+      }
     } catch (cause) {
       record.state = "FAILED";
       record.error = asCdepError(cause, "IMPORT_FAILED");
@@ -263,10 +311,11 @@ export function startReceiverSession(
 
     const receipt: Receipt = {
       transferId: request.transferId,
-      formatId: request.formatId,
       state: "IMPORTED",
       importedAt: Date.now(),
       sizeBytes,
+      fileCount: request.files.length,
+      formats: [...formats].sort(),
     };
     record.receipt = receipt;
     record.state = "IMPORTED";
@@ -357,6 +406,10 @@ export function startReceiverSession(
       transport?.destroy();
     },
   };
+}
+
+function distinctFormats(offer: Offer): string[] {
+  return [...new Set(offer.dataset.files.map((file) => file.formatId))].sort();
 }
 
 async function guard<T>(context: string, action: () => Promise<Result<T>>): Promise<Result<T>> {

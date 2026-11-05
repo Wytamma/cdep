@@ -60,6 +60,11 @@
       .upload { margin: 0 0 12px; max-width: 360px; }
       .upload input[type="file"] { min-width: 0; width: 100%; background: transparent; border: 0; padding: 0; }
       #tree:empty { display: none; }
+      #bundle { margin: 12px 0 0; padding-left: 18px; color: var(--muted); font-size: 13px; }
+      #bundle:empty { display: none; }
+      table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); }
+      th { color: var(--muted); font-weight: 600; }
       button { cursor: pointer; background: var(--accent); color: var(--bg); border-color: var(--accent); font-weight: 600; }
       button:disabled { opacity: 0.5; cursor: progress; }
       #status { margin: 12px 0 0; min-height: 1.5em; font-size: 14px; }
@@ -88,13 +93,23 @@
         <h2>Tree</h2>
         <p class="meta">
           <span id="source">Nothing loaded yet</span>
+          <span id="files">No files</span>
           <span id="leaves">No tree</span>
         </p>
         <label class="upload">
-          Load a Newick file
-          <input id="tree-file" type="file" accept=".nwk,.newick,.tree,text/plain" />
+          Load Newick files
+          <input id="tree-file" type="file" accept=".nwk,.newick,.tree,text/plain" multiple />
         </label>
         <svg id="tree"></svg>
+        <ul id="bundle"></ul>
+      </section>
+
+      <section id="metadata-section" hidden>
+        <h2>Metadata</h2>
+        <p class="meta">
+          <span id="metadata-source"></span>
+        </p>
+        <table id="metadata"></table>
       </section>
 
       <section>
@@ -107,7 +122,8 @@
           <label>
             Format
             <select id="format" name="format">
-              <option value="newick">Newick</option>
+              <option value="newick">Newick files</option>
+              <option value="bundle:tree-metadata">Tree + metadata (Newick + CSV)</option>
             </select>
           </label>
           <button type="submit" id="send" disabled>Send</button>

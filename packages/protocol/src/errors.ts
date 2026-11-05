@@ -22,6 +22,7 @@ export const CDEP_ERROR_CODES = [
   "AMBIGUOUS_FORMAT",
   "SCHEMA_MISMATCH",
   "SIZE_EXCEEDED",
+  "FILE_COUNT_EXCEEDED",
   // Transfer lifecycle.
   "OFFER_INVALID",
   "OFFER_UNKNOWN",

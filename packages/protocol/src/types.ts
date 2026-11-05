@@ -1,17 +1,20 @@
 /**
- * CDEP v0.1 wire types.
+ * CDEP v0.3 wire types.
  *
  * This module is transport-agnostic: every shape here is what a CDEP
  * implementation sends over its channel. Penpal is an implementation detail;
  * the specification (specification/protocol.md) documents these shapes.
  */
 import type { CdepError, Result } from "./errors.js";
+import type { JsonValue } from "./json.js";
 
 export const PROTOCOL = "cdep" as const;
-export const PROTOCOL_VERSION = 1 as const;
-export const PROTOCOL_VERSION_HEADER = "cdep-version";
+export const PROTOCOL_VERSION = 3 as const;
 
-/** Conservative default ceiling for a single v0.1 payload. */
+/** Hard protocol ceiling on files in one bundle; capabilities may be stricter. */
+export const MAX_BUNDLE_FILES = 16;
+
+/** Conservative default ceiling for the total payload of one transfer. */
 export const DEFAULT_MAX_BYTES = 10 * 1024 * 1024;
 export const DEFAULT_OFFER_TTL_MS = 5 * 60_000;
 export const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
@@ -30,8 +33,12 @@ export interface FormatCapability {
   label?: string;
   mediaTypes?: string[];
   extensions?: string[];
-  /** Maximum payload size this side accepts or produces, in bytes. */
+  /** Maximum cumulative size of this format's files in one bundle, in bytes. */
   maxBytes?: number;
+  /** Maximum number of files of this format in one bundle. */
+  maxFiles?: number;
+  /** Maximum size of any single file of this format, in bytes. */
+  maxFileBytes?: number;
   /** Present when a generic container is not enough (e.g. CSV with columns). */
   schema?: SchemaRef;
 }
@@ -50,12 +57,23 @@ export interface Capabilities {
   exports: FormatCapability[];
 }
 
-export interface DatasetDescriptor {
-  formatId: string;
+export interface DatasetFileDescriptor {
   name: string;
+  /** Every file carries its own format: a bundle may mix formats. */
+  formatId: string;
   sizeBytes: number;
   mediaType?: string;
   schema?: SchemaRef;
+  /** Free-form, format-specific metadata. No schema; JSON only. */
+  metadata?: JsonValue;
+}
+
+export interface DatasetDescriptor {
+  /** Human-readable bundle name, e.g. "tree + metadata". */
+  name: string;
+  /** Total size of all files. */
+  sizeBytes: number;
+  files: DatasetFileDescriptor[];
 }
 
 export interface SenderIdentity {
@@ -82,7 +100,6 @@ export interface OfferAck {
 
 export interface AcceptRequest {
   offerId: string;
-  formatId: string;
 }
 
 export interface AcceptAck {
@@ -90,21 +107,31 @@ export interface AcceptAck {
   acceptedAt: number;
 }
 
-export interface TransferRequest {
-  transferId: string;
+export interface TransferFile {
+  name: string;
   formatId: string;
   sizeBytes: number;
-  mediaType?: string;
+  /** Must match the metadata accepted in the offer, if any. */
+  metadata?: JsonValue;
   /** Text formats transfer as strings; binary formats as `ArrayBuffer`. */
   data: string | ArrayBuffer;
 }
 
+export interface TransferRequest {
+  transferId: string;
+  /** Total declared size of all files. */
+  sizeBytes: number;
+  files: TransferFile[];
+}
+
 export interface Receipt {
   transferId: string;
-  formatId: string;
   state: "IMPORTED";
   importedAt: number;
   sizeBytes: number;
+  fileCount: number;
+  /** Distinct format identifiers that were imported. */
+  formats: string[];
 }
 
 export interface TransferStatus {
@@ -169,24 +196,49 @@ export interface SenderService {
   cancel(request: CancelRequest): Promise<Result<CancelAck>>;
 }
 
-/** Dataset handed to an import adapter after validation. */
-export interface ImportedDataset {
-  formatId: string;
+export interface ImportedFile {
   name: string;
+  formatId: string;
   sizeBytes: number;
   mediaType?: string;
+  schema?: SchemaRef;
+  /** Free-form JSON supplied by the sender and verified against the offer. */
+  metadata?: JsonValue;
   data: string | ArrayBuffer;
+}
+
+/** Dataset handed to an import adapter after validation. */
+export interface ImportedBundle {
+  name: string;
+  sizeBytes: number;
+  files: ImportedFile[];
 }
 
 export interface ImportContext {
   transferId: string;
   senderOrigin: string;
   senderApplication: string;
+  bundle: {
+    name: string;
+    sizeBytes: number;
+    /** Manifest of every file in the bundle, including formats. */
+    files: Array<{ name: string; formatId: string }>;
+  };
+}
+
+export interface ExportFile {
+  name: string;
+  /** Required for bundle exports; inferred from the adapter format otherwise. */
+  formatId?: string;
+  mediaType?: string;
+  schema?: SchemaRef;
+  /** Free-form JSON; validated and bounded before it reaches the wire. */
+  metadata?: JsonValue;
+  data: string | ArrayBuffer | Uint8Array;
 }
 
 export interface ExportValue {
-  data: string | ArrayBuffer | Uint8Array;
+  /** Bundle name. Defaults to a name derived from the selection. */
   name?: string;
-  mediaType?: string;
-  schema?: SchemaRef;
+  files: ExportFile[];
 }

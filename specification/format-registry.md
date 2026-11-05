@@ -20,7 +20,10 @@ segment := [a-z0-9][a-z0-9-]*
 - Identifiers must not encode an extension: `.nwk`, `newick`, and `text/plain`
   are not identifiers.
 
-## 2. Registry v0.1
+Every file in a bundle declares its own format. Matching and schema checks are
+per file, so a bundle may combine a Newick tree with a CSV table.
+
+## 2. Registry v0.3
 
 | Identifier | Label | Media types | Extensions |
 | --- | --- | --- | --- |
@@ -87,6 +90,6 @@ applications may use private identifiers without waiting for a registry update.
 
 Generic CSV support is **not** evidence that the receiving application
 understands the dataset's columns. A tree viewer that can parse arbitrary
-tabular data cannot know which column is a taxon label. In v0.1 that is
+tabular data cannot know which column is a taxon label. In v0.3 that is
 expressed by declaring generic CSV separately from schema-specific CSV imports;
 the SDK will match only what the application actually implements.

@@ -1,5 +1,6 @@
 import { CdepException, fail, ok, type Result } from "./errors.js";
 import {
+  MAX_BUNDLE_FILES,
   PROTOCOL,
   PROTOCOL_VERSION,
   type ApplicationInfo,
@@ -89,6 +90,19 @@ function readFormatCapability(
   if (value.maxBytes !== undefined) {
     if (isPositiveSafeInteger(value.maxBytes)) capability.maxBytes = value.maxBytes;
     else issues.add(`${path}.maxBytes`, "expected a positive integer number of bytes");
+  }
+
+  if (value.maxFiles !== undefined) {
+    if (isPositiveSafeInteger(value.maxFiles) && value.maxFiles <= MAX_BUNDLE_FILES) {
+      capability.maxFiles = value.maxFiles;
+    } else {
+      issues.add(`${path}.maxFiles`, `expected an integer between 1 and ${MAX_BUNDLE_FILES}`);
+    }
+  }
+
+  if (value.maxFileBytes !== undefined) {
+    if (isPositiveSafeInteger(value.maxFileBytes)) capability.maxFileBytes = value.maxFileBytes;
+    else issues.add(`${path}.maxFileBytes`, "expected a positive integer number of bytes");
   }
 
   if (value.schema !== undefined) {

@@ -4,7 +4,7 @@ import { readRemoteResult, toTransportError } from "../src/result.js";
 
 const capabilities = {
   protocol: "cdep" as const,
-  version: 1 as const,
+  version: 3 as const,
   application: { name: "Tree Viewer" },
   imports: [{ id: "org.cdep.format.newick.v1" }],
   exports: [],

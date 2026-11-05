@@ -1,6 +1,12 @@
 import { createBridge } from "@cdep/browser";
-import { FASTA_V1, NEWICK_V1, normalizeFormatKey, registryCapability } from "@cdep/formats";
-import { CdepException } from "@cdep/protocol";
+import {
+  CSV_V1,
+  FASTA_V1,
+  NEWICK_V1,
+  normalizeFormatKey,
+  registryCapability,
+} from "@cdep/formats";
+import { CdepException, type ExportValue } from "@cdep/protocol";
 
 const DEMO_FASTA = [
   ">sample_1 Escherichia coli",
@@ -155,6 +161,15 @@ function readFasta(text: string): { name: string; length: number }[] {
   return records;
 }
 
+function metadataCsv(): string {
+  const rows = readFasta(fasta).map((record) => `${csvCell(record.name)},${record.length}`);
+  return ["name,length", ...rows].join("\n");
+}
+
+function csvCell(value: string): string {
+  return /[",\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
+}
+
 function showDataset(): void {
   const records = readFasta(fasta);
   elements.dataset.textContent = fasta;
@@ -183,30 +198,63 @@ const bridge = createBridge({
   application: { name: "Sequence App", url: `${location.origin}${location.pathname}` },
   normalizeFormatKey,
   imports: {
-    [FASTA_V1]: (dataset, context) => {
-      if (typeof dataset.data !== "string") throw new Error("FASTA payload must be text");
-      fasta = dataset.data;
+    [FASTA_V1]: (files, context) => {
+      const texts = files.map((file) => {
+        if (typeof file.data !== "string") throw new Error("FASTA payload must be text");
+        return file.data;
+      });
+      fasta = texts.join("\n");
       showDataset();
-      elements.source.textContent = `Imported "${dataset.name}" from ${context.senderOrigin}`;
+      elements.source.textContent = `Imported ${files.length} file(s) from ${context.senderOrigin}`;
       elements.session.dataset.state = "IMPORTED";
-      elements.session.textContent = `Imported ${dataset.sizeBytes} bytes from ${context.senderApplication}.`;
+      elements.session.textContent = `Imported ${files.length} file(s), ${context.bundle.sizeBytes} bytes from ${context.senderApplication}.`;
     },
   },
   exports: {
-    [NEWICK_V1]: () => ({ data: newickPayload(), name: "tree.newick", mediaType: "text/plain" }),
-    [FASTA_V1]: () => ({ data: fasta, name: "sequences.fasta", mediaType: "text/plain" }),
+    [NEWICK_V1]: () => ({
+      name: "tree.newick",
+      files: [{ name: "tree.nwk", data: newickPayload() }],
+    }),
+    [FASTA_V1]: () => ({
+      name: "sequences.fasta",
+      files: [{ name: "sequences.fasta", data: fasta }],
+    }),
+    [CSV_V1]: () => ({
+      name: "metadata.csv",
+      files: [{ name: "metadata.csv", data: metadataCsv() }],
+    }),
+  },
+  bundles: {
+    "tree-metadata": (): ExportValue => ({
+      name: "tree + metadata",
+      files: [
+        {
+          name: "tree.nwk",
+          formatId: NEWICK_V1,
+          data: newickPayload(),
+          metadata: { source: "sequence-app", tips: readFasta(fasta).length },
+        },
+        {
+          name: "metadata.csv",
+          formatId: CSV_V1,
+          data: metadataCsv(),
+          metadata: { columns: ["name", "length"] },
+        },
+      ],
+    }),
   },
   importCapabilities: { [FASTA_V1]: registryCapability(FASTA_V1) },
   exportCapabilities: {
     [NEWICK_V1]: registryCapability(NEWICK_V1),
     [FASTA_V1]: registryCapability(FASTA_V1),
+    [CSV_V1]: registryCapability(CSV_V1),
   },
   onState: (snapshot) => {
     elements.session.dataset.state = snapshot.state;
     elements.session.textContent =
       snapshot.state === "IMPORTED"
         ? `Imported "${snapshot.datasetName}".`
-        : `Incoming "${snapshot.datasetName}" (${snapshot.formatId}): ${snapshot.state}`;
+        : `Incoming "${snapshot.datasetName}" (${snapshot.fileCount} file(s), ${snapshot.formats.join(", ")}): ${snapshot.state}`;
   },
   onError: (error) => {
     elements.session.dataset.state = "FAILED";
@@ -230,7 +278,8 @@ renderTreeStatus();
 
 elements.form.addEventListener("submit", (event) => {
   event.preventDefault();
-  if (elements.format.value === "newick") {
+  const choice = elements.format.value;
+  if (choice === "newick" || choice === "bundle:tree-metadata") {
     const report = inspectTreeInput(elements.treeEditor.value);
     if (!report.valid) {
       setStatus(`Fix the Newick draft — ${report.message}`, "error");
@@ -238,11 +287,15 @@ elements.form.addEventListener("submit", (event) => {
     }
   }
   setStatus("Opening the receiving application…");
+  const sendOptions =
+    choice === "bundle:tree-metadata"
+      ? { bundle: "tree-metadata" }
+      : { format: choice };
   bridge
-    .sendTo(elements.target.value, { format: elements.format.value })
+    .sendTo(elements.target.value, sendOptions)
     .then((receipt) => {
       setStatus(
-        `Imported ${receipt.sizeBytes} bytes as ${receipt.formatId} (transfer ${receipt.transferId.slice(0, 8)}…).`,
+        `Imported ${receipt.fileCount} file(s) (${receipt.sizeBytes} bytes; ${receipt.formats.join(", ")}) (transfer ${receipt.transferId.slice(0, 8)}…).`,
       );
     })
     .catch((error: unknown) => {

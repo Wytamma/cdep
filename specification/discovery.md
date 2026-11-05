@@ -1,6 +1,6 @@
 # Discovery and session bootstrap
 
-v0.1 uses runtime discovery over the message channel. There is no manifest, no
+v0.3 uses runtime discovery over the message channel. There is no manifest, no
 directory, and no `/cdep/receiver.html` endpoint.
 
 ## 1. What the user supplies is the destination
