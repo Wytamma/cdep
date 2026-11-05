@@ -1,0 +1,31 @@
+{
+  "name": "cdep",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Client Data Exchange Protocol: capability discovery and user-approved dataset transfer between browser applications, with no backend.",
+  "license": "MIT",
+  "type": "module",
+  "packageManager": "pnpm@10.23.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "pnpm -r --filter './packages/**' run build",
+    "typecheck": "pnpm run build && tsc -p tsconfig.tools.json --noEmit && tsc -p examples/sequence-app/tsconfig.json --noEmit && tsc -p examples/tree-viewer/tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "e2e": "playwright test",
+    "e2e:chromium": "playwright test --project=chromium",
+    "verify": "pnpm run typecheck && pnpm test && pnpm e2e"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.64.1",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.0",
+    "vitest": "^2.1.8"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"]
+  }
+}
